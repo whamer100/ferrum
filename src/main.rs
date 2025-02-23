@@ -1,15 +1,18 @@
-use std::path::{PathBuf};
 use serde_json::{json, Value};
-use std::collections::{VecDeque};
-use std::env;
-use std::io::{Read, Write};
-use std::time::{Instant, SystemTime};
-use fomat_macros::{fomat};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    io::Write,
+    time::{Instant, SystemTime},
+    println as real_println,
+    sync::Mutex
+};
+use fomat_macros::fomat;
 use lazy_static::lazy_static;
 use tokio_stream::StreamExt;
-use const_format::{formatcp};
+use const_format::formatcp;
 use reqwest::header::{HeaderMap, USER_AGENT};
-use tokio::io::{AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 const DL_ANIM_RATE: f64 = 1. / 10.;  // update every 0.1 seconds
@@ -17,6 +20,7 @@ const FERRUM_USER_AGENT: &'static str = formatcp!("Ferrum/{} (https://github.com
 
 lazy_static! {
     static ref CLIENT: reqwest::Client = reqwest::Client::new();
+    static ref LOG_FILE: Mutex<std::fs::File> = Mutex::new(std::fs::File::create("ferrum.log").unwrap());
     static ref DOWNLOAD_ANIM: Vec<char> = vec!['|', '/', '-', '\\'];
     static ref EMULATOR_INFO_TABLE: Value = json!({
     "fbneo": {
@@ -53,6 +57,19 @@ lazy_static! {
 });
 }
 
+// custom println to simultaneously log to file
+macro_rules! println {
+    ($fmt:expr) => {
+        real_println!("{}", $fmt);
+        writeln!(LOG_FILE.lock().unwrap(), "{}", $fmt).unwrap();
+    };
+
+    ($fmt:expr, $($args:tt)*) => {
+        real_println!("{}", format_args!($fmt, $($args)*));
+        writeln!(LOG_FILE.lock().unwrap(), "{}", format_args!($fmt, $($args)*)).unwrap();
+    };
+}
+
 #[derive(Default, Debug)]
 struct ProgramState {
     frm_path: PathBuf,
@@ -80,15 +97,7 @@ impl ExtractPair {
 fn populate_queue(state: &mut ProgramState) {
     if let Some(rom_ctx) = state.rom_json_ctx.get(&state.rom_id) {
         state.download_queue.push_front(state.rom_id.to_string());
-        if let Some(rroms) = rom_ctx.get("require") {
-            if let Some(required_roms) = rroms.as_array() {
-                for rrom in required_roms {
-                    state.download_queue.push_back(rrom.as_str().unwrap().to_string());
-                }
-            }
-        }
-        // cursed edge case moment
-        else if let Some(rroms) = rom_ctx.get("required") {
+        if let Some(rroms) = rom_ctx.get("require").or_else(|| rom_ctx.get("required")) {
             if let Some(required_roms) = rroms.as_array() {
                 for rrom in required_roms {
                     state.download_queue.push_back(rrom.as_str().unwrap().to_string());
@@ -159,11 +168,7 @@ async fn download_file(url: &str, source_file: &str, output_file: &PathBuf) {
             std::io::stdout().flush().unwrap();
             anim_frame = (anim_frame + 1) % DOWNLOAD_ANIM.len();
         }
-        // let download_percentage: f64 = (file_progress as f64 / file_sz as f64) * 100f64;
-        // print!("  {} Downloading {source_file}: {download_percentage:>8.4}%... [{elapsed}]      \r", DOWNLOAD_ANIM[anim_frame]);
-        // anim_frame = (anim_frame + 1) % DOWNLOAD_ANIM.len();
     }
-
 }
 
 async fn download_queue(state: &mut ProgramState) {
@@ -220,10 +225,10 @@ async fn download_queue(state: &mut ProgramState) {
         let end = SystemTime::now();
         match end.duration_since(start) {
             Ok(elapsed) => {
-                println!("  * File {source_file} downloaded in {:.2}s.       ", elapsed.as_secs_f64());
+                println!("  * File {} downloaded in {:.2}s.       ", source_file, elapsed.as_secs_f64());
             }
             Err(e) => {
-                println!("  - Error [{e:?}] when using SystemTime for some reason!");
+                println!("  - Error [{:?}] when using SystemTime for some reason!", e);
             }
         }
 
@@ -243,7 +248,6 @@ async fn download_queue(state: &mut ProgramState) {
                         continue
                     }
                     let index = index_opt.unwrap();
-                    // println!("{index} -> {}", pair.src);
 
                     let inner_output_file = output_path.join(&pair.dst);
                     let inner_output_folder = inner_output_file.parent().unwrap();
@@ -262,11 +266,6 @@ async fn download_queue(state: &mut ProgramState) {
             // out of zip context, safe to delete file now
             std::fs::remove_file(output_file).unwrap()
         }
-
-
-        // println!("{extract_list:?}");
-        // println!("{source_file:?} {output_path:?} {output_file:?}");
-        // println!("{:?} {source_file} {output_path:?}", rom_info);
     }
 }
 
@@ -315,7 +314,6 @@ async fn fetch_rom(state: &mut ProgramState) {
     let json_str = tokio::fs::read_to_string(&state.json_file).await;
     if json_str.is_ok() {
         state.rom_json_ctx = serde_json::from_str(json_str.unwrap().as_str()).unwrap();
-
     } else {
         println!("  Error: Failed to open file [{}]", state.json_file);
         return;
@@ -324,42 +322,30 @@ async fn fetch_rom(state: &mut ProgramState) {
     println!("  Searching for required roms...");
     populate_queue(state);
     download_queue(state).await;
-    // println!("{:?}", state);
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<_> = env::args().collect();
+    let args: Vec<_> = std::env::args().collect();
     let mut state = ProgramState::default();
 
-    println!("\nFerrum - Fightcade Rom Manager v.{VERSION}");
+    println!("\nFerrum - Fightcade Rom Manager v.{}", VERSION);
     if args.len() < 2 {
         println!("  Error: missing arguments. Syntax: frm <emulator> <rom_id>");
         return Ok(());
     }
 
+    /*
+        TODO eventually:
+          - improve error handling
+          - clean up overall codebase
+    */
 
     state.frm_path = std::env::current_exe()?.parent().unwrap().to_path_buf();
     state.emulator = args[1].to_owned();
     state.rom_id = args[2].to_owned();
 
-    // let client = reqwest::Client::new();
-    //
-    // let resp = client.get("https://httpbin.org/ip").send().await?;
-    // let test: Value = resp.json().await?;
-    // println!("{}", test["origin"]);
-
     fetch_rom(&mut state).await;
-
-    {  // block for letting the end user read the logs (at least until i get it to log to disk)
-        let mut stdin = std::io::stdin();
-        let mut stdout = std::io::stdout();
-
-        write!(stdout, "Press any key to continue...").unwrap();
-        stdout.flush().unwrap();
-
-        let _ = stdin.read(&mut [0u8]).unwrap();
-    }
 
     Ok(())
 }
